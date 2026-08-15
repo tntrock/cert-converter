@@ -1,6 +1,6 @@
 # 憑證格式轉換工具（cert-converter）
 
-純 Rust、**完全離線**、**免安裝單一 exe** 的 Windows 憑證格式轉換 GUI 工具。
+純 Rust、**完全離線**、**免安裝** 的 Windows 憑證格式轉換 GUI 工具。
 專為網頁憑證（SSL/TLS）日常維運設計，支援拖放操作與憑證內容檢視。
 
 ---
@@ -16,8 +16,7 @@
   - 私鑰 `PKCS#1` ⇄ `PKCS#8`、EC `SEC1` → `PKCS#8`
 - **安全性**：私鑰僅存於記憶體、不寫任何暫存檔；全程無網路呼叫，可在內網／離線環境使用
 
-技術棧全部為**純 Rust**（`eframe`/`egui` + `p12-keystore` + `x509-parser` + `rsa`/`p256`/`p384`），
-**不需要 OpenSSL DLL**，最終產物為單一 `.exe`。
+技術棧全部為**純 Rust**（`eframe`/`egui` + `p12-keystore` + `x509-parser` + `rsa`/`p256`/`p384`）
 
 ---
 
@@ -42,8 +41,6 @@ cargo build --release
 ```
 target\release\cert-converter.exe
 ```
-
-這個 `.exe` 即為**免安裝、可單獨複製**的執行檔（雙擊即可執行，不會跳出黑色主控台視窗）。
 
 ### 3.（可選）進一步縮小體積
 已在 `Cargo.toml` 設定體積最佳化。若想再壓縮，可用 [UPX](https://upx.github.io/)：

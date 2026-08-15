@@ -1,0 +1,34 @@
+[package]
+name = "cert-converter"
+version = "1.0.0"
+edition = "2021"
+description = "憑證格式轉換工具 - 純 Rust、離線、免安裝的 Windows GUI"
+license = "MIT OR Apache-2.0"
+
+[[bin]]
+name = "cert-converter"
+path = "src/main.rs"
+
+[dependencies]
+# ---- GUI (純 Rust、單一 exe、支援拖放) ----
+eframe = "0.29"
+egui = "0.29"
+rfd = "0.15"                       # 原生檔案儲存/開啟對話框
+
+# ---- 憑證 / 金鑰處理 (皆為純 Rust，無需 OpenSSL DLL) ----
+p12-keystore = "0.3"              # PFX/PKCS#12 讀寫，含舊式加密支援
+x509-parser = "0.16"              # 憑證內容解析 (CN/SAN/有效期…)
+pem = "3"                         # PEM 編解碼
+sha2 = "0.10"                     # SHA-256 指紋
+rsa = "0.9"                       # RSA 私鑰 PKCS#1 <-> PKCS#8
+p256 = { version = "0.13", features = ["pkcs8"] }   # EC(P-256) SEC1 -> PKCS#8
+p384 = { version = "0.13", features = ["pkcs8"] }   # EC(P-384) SEC1 -> PKCS#8
+anyhow = "1"
+
+# 發行版建置最佳化：更小的 exe、更快的執行速度
+[profile.release]
+opt-level = "z"     # 最小化體積
+lto = true
+codegen-units = 1
+strip = true
+panic = "abort"

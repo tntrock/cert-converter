@@ -4,15 +4,16 @@
 mod certcore;
 
 use certcore::{
-    build_pfx, cert_der_to_pem, cert_info, convert_key_to_other_pem, detect,
-    key_convert_button_label, pfx_to_pem_bundle, CertInfo, KeyKind, Loaded,
+    build_pfx, cert_info, certs_to_pem, decrypt_key, der_to_pem, detect, export_key_pem, key_alg,
+    key_formats, pem_bundle, unlock_pfx, CertInfo, KeyFormat, Loaded,
 };
 use std::path::{Path, PathBuf};
+use zeroize::Zeroizing;
 
 fn main() -> eframe::Result<()> {
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
-            .with_inner_size([920.0, 700.0])
+            .with_inner_size([920.0, 720.0])
             .with_min_inner_size([760.0, 560.0])
             .with_title("憑證格式轉換工具"),
         ..Default::default()
@@ -23,7 +24,12 @@ fn main() -> eframe::Result<()> {
         options,
         Box::new(|cc| {
             setup_fonts(&cc.egui_ctx);
-            Ok(Box::new(App::default()))
+            let mut app = App::default();
+            // 支援「把檔案拖到 exe 上」或「開啟檔案的程式」：第一個參數為檔案路徑
+            if let Some(path) = std::env::args_os().nth(1) {
+                app.load_file(Path::new(&path));
+            }
+            Ok(Box::new(app))
         }),
     )
 }
@@ -63,17 +69,45 @@ fn setup_fonts(ctx: &egui::Context) {
     ctx.set_fonts(fonts);
 }
 
+/// 使用者在這一幀按下的操作。先收集、畫完 UI 後再執行，
+/// 避免在借用 `self.loaded` 時呼叫 `&mut self` 方法（也不必每幀複製私鑰）。
+/// 輸出檔案：(預設檔名, 篩選器名稱, 副檔名, 內容)
+type Output = (
+    String,
+    &'static str,
+    &'static [&'static str],
+    Zeroizing<Vec<u8>>,
+);
+
+enum Action {
+    PickFile,
+    Clear,
+    UnlockPfx,
+    UnlockKey,
+    SaveCertPem,
+    SaveCertDer,
+    SaveChain,
+    SaveFullchain,
+    SaveKey(KeyFormat),
+    SaveBundle,
+    BuildPfx,
+}
+
 #[derive(Default)]
 struct App {
-    file_name: Option<String>,
+    file_path: Option<PathBuf>,
     loaded: Option<Loaded>,
     info: Option<CertInfo>,
     info_note: Option<String>, // 憑證資訊尚未取得時的提示（例如 PFX 未解鎖）
+    key_match: Option<bool>,   // 私鑰是否與葉憑證成對（載入時計算一次）
 
-    // 密碼欄
-    open_password: String, // 用來解鎖 PFX
-    out_password: String,  // 產生 PFX 時的密碼
-    legacy: bool,          // PFX 輸出：是否使用舊式相容加密
+    // 密碼欄（釋放時清零）
+    open_password: Zeroizing<String>, // 用來解鎖 PFX
+    key_password: Zeroizing<String>,  // 用來解開加密私鑰
+    out_password: Zeroizing<String>,  // 產生 PFX 時的密碼
+    out_password2: Zeroizing<String>, // 再次輸入確認
+    show_password: bool,
+    legacy: bool, // PFX 輸出：是否使用舊式相容加密
 
     // 狀態訊息（is_error, 內容）
     status: Vec<(bool, String)>,
@@ -91,17 +125,28 @@ impl App {
         self.loaded = None;
         self.info = None;
         self.info_note = None;
+        self.key_match = None;
         self.open_password.clear();
+        self.key_password.clear();
         self.out_password.clear();
+        self.out_password2.clear();
         self.legacy = false;
     }
 
     fn load_file(&mut self, path: &Path) {
         self.reset();
-        self.file_name = Some(path.to_string_lossy().to_string());
+        self.file_path = Some(path.to_path_buf());
 
+        // 憑證檔通常只有數 KB，過大的檔案多半是拖錯檔，避免整個讀進記憶體
+        const MAX_SIZE: u64 = 10 * 1024 * 1024;
+        if let Ok(meta) = std::fs::metadata(path) {
+            if meta.len() > MAX_SIZE {
+                self.err("檔案超過 10 MB，不像是憑證或金鑰檔");
+                return;
+            }
+        }
         let bytes = match std::fs::read(path) {
-            Ok(b) => b,
+            Ok(b) => Zeroizing::new(b),
             Err(e) => {
                 self.err(format!("讀取檔案失敗：{e}"));
                 return;
@@ -110,58 +155,216 @@ impl App {
 
         match detect(&bytes) {
             Ok(loaded) => {
-                // 若能立刻取得葉憑證，就順便解析資訊
-                match &loaded {
-                    Loaded::DerCert { der } => self.compute_info(&der.clone()),
-                    Loaded::Pem { certs, .. } => {
-                        if let Some(first) = certs.first() {
-                            self.compute_info(&first.clone());
-                        }
-                    }
-                    Loaded::Pfx { .. } => {
-                        self.info_note = Some("輸入密碼解鎖後即可顯示憑證內容。".to_string());
-                    }
-                }
                 self.ok(format!("已載入：{}", loaded.type_label()));
-                self.loaded = Some(loaded);
+                self.set_loaded(loaded);
             }
             Err(e) => self.err(format!("{e}")),
         }
     }
 
-    fn compute_info(&mut self, der: &[u8]) {
-        match cert_info(der) {
-            Ok(info) => {
-                self.info = Some(info);
-                self.info_note = None;
+    /// 設定目前內容，並更新憑證資訊與附註。
+    fn set_loaded(&mut self, loaded: Loaded) {
+        self.info = None;
+        self.info_note = None;
+        self.key_match = None;
+        match &loaded {
+            Loaded::LockedPfx { .. } => {
+                self.info_note = Some("輸入密碼解鎖後即可顯示憑證內容。".to_string());
             }
-            Err(e) => {
-                self.info = None;
-                self.info_note = Some(format!("無法解析憑證內容：{e}"));
+            Loaded::Items(items) => {
+                if let Some(leaf) = items.certs.first() {
+                    match cert_info(leaf) {
+                        Ok(info) => self.info = Some(info),
+                        Err(e) => self.info_note = Some(format!("無法解析憑證內容：{e}")),
+                    }
+                }
+                self.key_match = items.key_matches_leaf();
+                for note in items.notes.clone() {
+                    self.ok(note);
+                }
             }
         }
+        self.loaded = Some(loaded);
     }
 
-    /// 開啟儲存對話框並寫入位元組。
-    fn save_bytes(&mut self, default_name: &str, filter: &str, exts: &[&str], data: &[u8]) {
-        if let Some(path) = rfd::FileDialog::new()
+    /// 開啟儲存對話框並寫入位元組。使用者取消時回傳 false。
+    fn save_bytes(&mut self, default_name: &str, filter: &str, exts: &[&str], data: &[u8]) -> bool {
+        let Some(path) = rfd::FileDialog::new()
             .set_file_name(default_name)
             .add_filter(filter, exts)
             .save_file()
-        {
-            match std::fs::write(&path, data) {
-                Ok(_) => self.ok(format!("已儲存：{}", path.display())),
-                Err(e) => self.err(format!("寫入失敗：{e}")),
+        else {
+            return false;
+        };
+        match std::fs::write(&path, data) {
+            Ok(_) => {
+                self.ok(format!("已儲存：{}", path.display()));
+                true
+            }
+            Err(e) => {
+                self.err(format!("寫入失敗：{e}"));
+                false
             }
         }
     }
 
     fn base_name(&self) -> String {
-        self.file_name
+        self.file_path
             .as_ref()
-            .and_then(|f| Path::new(f).file_stem())
+            .and_then(|f| f.file_stem())
             .map(|s| s.to_string_lossy().to_string())
             .unwrap_or_else(|| "output".to_string())
+    }
+
+    fn run(&mut self, action: Action) {
+        match action {
+            Action::PickFile => {
+                if let Some(path) = rfd::FileDialog::new()
+                    .add_filter(
+                        "憑證/金鑰",
+                        &[
+                            "pfx", "p12", "pem", "crt", "cer", "der", "key", "p7b", "p7c",
+                        ],
+                    )
+                    .add_filter("所有檔案", &["*"])
+                    .pick_file()
+                {
+                    self.load_file(&path);
+                }
+                return;
+            }
+            Action::Clear => {
+                self.file_path = None;
+                self.reset();
+                self.status.clear();
+                return;
+            }
+            Action::UnlockPfx => {
+                let Some(Loaded::LockedPfx { data }) = &self.loaded else {
+                    return;
+                };
+                match unlock_pfx(data, &self.open_password) {
+                    Ok(items) => {
+                        self.open_password.clear();
+                        self.ok(format!("PFX 已解鎖：{}", items.type_label()));
+                        self.set_loaded(Loaded::Items(items));
+                    }
+                    Err(e) => self.err(format!("{e}")),
+                }
+                return;
+            }
+            Action::UnlockKey => {
+                let Some(Loaded::Items(items)) = &self.loaded else {
+                    return;
+                };
+                let Some(enc) = &items.encrypted_key else {
+                    return;
+                };
+                match decrypt_key(enc, &self.key_password) {
+                    Ok(key) => {
+                        let mut items = items.clone();
+                        items.key = Some(key);
+                        items.encrypted_key = None;
+                        items.notes.clear();
+                        items.normalize();
+                        self.key_password.clear();
+                        self.ok("私鑰已解密");
+                        self.set_loaded(Loaded::Items(items));
+                    }
+                    Err(e) => self.err(format!("{e}")),
+                }
+                return;
+            }
+            _ => {}
+        }
+
+        // 以下為輸出動作，需要已解開的內容
+        let Some(Loaded::Items(items)) = &self.loaded else {
+            return;
+        };
+        let base = self.base_name();
+        let result: anyhow::Result<Output> = (|| {
+            let key = || {
+                items
+                    .key
+                    .as_ref()
+                    .ok_or_else(|| anyhow::anyhow!("沒有可用的私鑰"))
+            };
+            let leaf = || {
+                items
+                    .certs
+                    .first()
+                    .ok_or_else(|| anyhow::anyhow!("沒有可用的憑證"))
+            };
+            let bytes = |s: String| Zeroizing::new(s.into_bytes());
+            Ok(match action {
+                Action::SaveCertPem => (
+                    format!("{base}.crt"),
+                    "PEM 憑證",
+                    &["crt", "pem", "cer"][..],
+                    bytes(der_to_pem("CERTIFICATE", leaf()?)),
+                ),
+                Action::SaveCertDer => (
+                    format!("{base}.der"),
+                    "DER 憑證",
+                    &["der", "cer"][..],
+                    Zeroizing::new(leaf()?.clone()),
+                ),
+                Action::SaveChain => (
+                    format!("{base}-chain.crt"),
+                    "PEM 憑證鏈",
+                    &["crt", "pem"][..],
+                    bytes(certs_to_pem(&items.certs[1..])),
+                ),
+                Action::SaveFullchain => (
+                    format!("{base}-fullchain.crt"),
+                    "PEM 憑證鏈",
+                    &["crt", "pem"][..],
+                    bytes(certs_to_pem(&items.certs)),
+                ),
+                Action::SaveKey(format) => {
+                    let pem = export_key_pem(key()?, format)?;
+                    (
+                        format!("{base}-{}.key", format.file_suffix()),
+                        "私鑰 (PEM)",
+                        &["key", "pem"][..],
+                        Zeroizing::new(pem.as_bytes().to_vec()),
+                    )
+                }
+                Action::SaveBundle => {
+                    let pem = pem_bundle(&items.certs, key()?)?;
+                    (
+                        format!("{base}-bundle.pem"),
+                        "PEM",
+                        &["pem"][..],
+                        Zeroizing::new(pem.as_bytes().to_vec()),
+                    )
+                }
+                Action::BuildPfx => {
+                    if self.out_password.is_empty() {
+                        anyhow::bail!("請先設定 PFX 密碼");
+                    }
+                    if *self.out_password != *self.out_password2 {
+                        anyhow::bail!("兩次輸入的 PFX 密碼不一致");
+                    }
+                    let pfx = build_pfx(&items.certs, key()?, &self.out_password, self.legacy)?;
+                    (
+                        format!("{base}.pfx"),
+                        "PFX",
+                        &["pfx", "p12"][..],
+                        Zeroizing::new(pfx),
+                    )
+                }
+                _ => unreachable!(),
+            })
+        })();
+
+        match result {
+            Ok((name, filter, exts, data)) => {
+                self.save_bytes(&name, filter, exts, &data);
+            }
+            Err(e) => self.err(format!("{e}")),
+        }
     }
 }
 
@@ -179,27 +382,34 @@ impl eframe::App for App {
             self.load_file(&path);
         }
 
+        let mut action = None;
         egui::CentralPanel::default().show(ctx, |ui| {
             egui::ScrollArea::vertical().show(ui, |ui| {
                 self.header(ui);
                 ui.separator();
-                self.drop_zone(ui);
+                action = self.drop_zone(ui);
                 ui.add_space(8.0);
                 self.info_panel(ui);
-                self.actions_panel(ui);
+                action = self.actions_panel(ui).or(action.take());
                 ui.add_space(8.0);
                 self.status_panel(ui);
             });
         });
+        if let Some(action) = action {
+            self.run(action);
+        }
     }
 }
+
+const GRAY: egui::Color32 = egui::Color32::from_rgb(140, 140, 140);
+const GREEN: egui::Color32 = egui::Color32::from_rgb(40, 130, 70);
+const ORANGE: egui::Color32 = egui::Color32::from_rgb(190, 110, 30);
+const RED: egui::Color32 = egui::Color32::from_rgb(190, 60, 60);
 
 // ---- UI 區塊 ----
 impl App {
     fn header(&mut self, ui: &mut egui::Ui) {
-        ui.horizontal(|ui| {
-            ui.heading("🔐 憑證格式轉換工具");
-        });
+        ui.heading("🔐 憑證格式轉換工具");
         ui.label(
             egui::RichText::new("純離線運作 · 私鑰僅存於記憶體、不寫暫存檔 · 免安裝單一執行檔")
                 .small()
@@ -207,14 +417,15 @@ impl App {
         );
     }
 
-    fn drop_zone(&mut self, ui: &mut egui::Ui) {
+    fn drop_zone(&mut self, ui: &mut egui::Ui) -> Option<Action> {
+        let mut action = None;
         let (rect, _resp) =
             ui.allocate_exact_size(egui::vec2(ui.available_width(), 92.0), egui::Sense::hover());
         let painter = ui.painter();
         painter.rect_stroke(
             rect,
             8.0,
-            egui::Stroke::new(1.5, egui::Color32::from_rgb(150, 160, 200)),
+            egui::Stroke::new(1.5_f32, egui::Color32::from_rgb(150, 160, 200)),
         );
         painter.text(
             rect.center() + egui::vec2(0.0, -10.0),
@@ -226,35 +437,21 @@ impl App {
         painter.text(
             rect.center() + egui::vec2(0.0, 16.0),
             egui::Align2::CENTER_CENTER,
-            "支援 .pfx .p12 .pem .crt .cer .der .key",
+            "支援 .pfx .p12 .pem .crt .cer .der .key .p7b",
             egui::FontId::proportional(12.0),
-            egui::Color32::from_rgb(140, 140, 140),
+            GRAY,
         );
 
         ui.add_space(6.0);
         ui.horizontal(|ui| {
             if ui.button("📂 選擇檔案…").clicked() {
-                if let Some(path) = rfd::FileDialog::new()
-                    .add_filter(
-                        "憑證/金鑰",
-                        &["pfx", "p12", "pem", "crt", "cer", "der", "key"],
-                    )
-                    .add_filter("所有檔案", &["*"])
-                    .pick_file()
-                {
-                    self.load_file(&path);
-                }
+                action = Some(Action::PickFile);
             }
             if self.loaded.is_some() && ui.button("🗑 清除").clicked() {
-                self.file_name = None;
-                self.reset();
-                self.status.clear();
+                action = Some(Action::Clear);
             }
-            if let Some(name) = &self.file_name {
-                ui.label(
-                    egui::RichText::new(format!("目前檔案：{name}"))
-                        .color(egui::Color32::from_rgb(80, 80, 80)),
-                );
+            if let Some(path) = &self.file_path {
+                ui.label(egui::RichText::new(format!("目前檔案：{}", path.display())).weak());
             }
         });
 
@@ -266,6 +463,7 @@ impl App {
                     .color(egui::Color32::from_rgb(40, 110, 60)),
             );
         }
+        action
     }
 
     fn info_panel(&mut self, ui: &mut egui::Ui) {
@@ -275,6 +473,7 @@ impl App {
         let Some(info) = &self.info else {
             return;
         };
+        let key_match = self.key_match;
 
         egui::CollapsingHeader::new("📄 憑證內容")
             .default_open(true)
@@ -284,10 +483,28 @@ impl App {
                     .spacing([12.0, 6.0])
                     .striped(true)
                     .show(ui, |ui| {
+                        if let Some(cn) = &info.common_name {
+                            row(ui, "一般名稱 (CN)", cn);
+                        }
                         row(ui, "主體 (Subject)", &info.subject);
                         row(ui, "簽發者 (Issuer)", &info.issuer);
                         row(ui, "生效時間", &info.not_before);
-                        row(ui, "到期時間", &info.not_after);
+                        ui.label(egui::RichText::new("到期時間").strong());
+                        let (text, color) = if info.days_left < 0 {
+                            (format!("{}（已過期）", info.not_after), RED)
+                        } else if info.days_left <= 30 {
+                            (
+                                format!("{}（剩 {} 天，即將到期）", info.not_after, info.days_left),
+                                ORANGE,
+                            )
+                        } else {
+                            (
+                                format!("{}（剩 {} 天）", info.not_after, info.days_left),
+                                GREEN,
+                            )
+                        };
+                        ui.colored_label(color, text);
+                        ui.end_row();
                         row(ui, "序號", &info.serial);
                         row(ui, "金鑰類型", &info.key_type);
                         row(ui, "SHA-256 指紋", &info.sha256);
@@ -297,157 +514,168 @@ impl App {
                             info.sans.join("\n")
                         };
                         row(ui, "主體別名 (SAN)", &sans);
+                        if let Some(m) = key_match {
+                            ui.label(egui::RichText::new("私鑰配對").strong());
+                            if m {
+                                ui.colored_label(GREEN, "✔ 私鑰與此憑證成對");
+                            } else {
+                                ui.colored_label(RED, "✖ 私鑰與檔案中的憑證都不成對");
+                            }
+                            ui.end_row();
+                        }
                     });
             });
     }
 
-    fn actions_panel(&mut self, ui: &mut egui::Ui) {
-        // 先把整個輸入內容 clone 成本地變數，避免在呼叫 &mut self 方法時仍借用 self.loaded
-        let Some(loaded) = self.loaded.clone() else {
-            return;
-        };
+    fn password_field(ui: &mut egui::Ui, label: &str, value: &mut String, show: bool) -> bool {
+        ui.horizontal(|ui| {
+            ui.label(label);
+            let resp = ui.add(
+                egui::TextEdit::singleline(value)
+                    .password(!show)
+                    .desired_width(240.0),
+            );
+            resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter))
+        })
+        .inner
+    }
+
+    fn actions_panel(&mut self, ui: &mut egui::Ui) -> Option<Action> {
+        let loaded = self.loaded.as_ref()?;
+        let mut action = None;
 
         ui.add_space(6.0);
         ui.separator();
         ui.heading("轉換");
 
-        match &loaded {
-            Loaded::DerCert { der } => {
-                let der = der.clone();
-                if ui.button("DER → PEM 憑證（.pem）").clicked() {
-                    let pem = cert_der_to_pem(&der);
-                    let name = format!("{}.pem", self.base_name());
-                    self.save_bytes(&name, "PEM 憑證", &["pem", "crt"], pem.as_bytes());
+        let items = match loaded {
+            Loaded::LockedPfx { .. } => {
+                let enter = Self::password_field(
+                    ui,
+                    "PFX 密碼：",
+                    &mut self.open_password,
+                    self.show_password,
+                );
+                ui.checkbox(&mut self.show_password, "顯示密碼");
+                if ui.button("🔓 解鎖 PFX").clicked() || enter {
+                    action = Some(Action::UnlockPfx);
                 }
+                return action;
             }
+            Loaded::Items(items) => items,
+        };
 
-            Loaded::Pfx { data } => {
-                let data = data.clone();
-                ui.horizontal(|ui| {
-                    ui.label("PFX 密碼：");
-                    ui.add(
-                        egui::TextEdit::singleline(&mut self.open_password)
-                            .password(true)
-                            .desired_width(240.0),
-                    );
-                });
-                if ui.button("🔓 解鎖並輸出 PEM（私鑰＋憑證鏈）").clicked() {
-                    match pfx_to_pem_bundle(&data, &self.open_password) {
-                        Ok((pem, leaf)) => {
-                            if let Some(leaf) = leaf {
-                                self.compute_info(&leaf);
-                            }
-                            let name = format!("{}.pem", self.base_name());
-                            self.save_bytes(&name, "PEM", &["pem"], pem.as_bytes());
-                        }
-                        Err(e) => self.err(format!("{e}")),
-                    }
+        // 加密私鑰：先解密
+        if items.encrypted_key.is_some() && items.key.is_none() {
+            ui.group(|ui| {
+                ui.label(egui::RichText::new("🔒 偵測到加密的私鑰").strong());
+                let enter = Self::password_field(
+                    ui,
+                    "私鑰密碼：",
+                    &mut self.key_password,
+                    self.show_password,
+                );
+                ui.checkbox(&mut self.show_password, "顯示密碼");
+                if ui.button("🔓 解密私鑰").clicked() || enter {
+                    action = Some(Action::UnlockKey);
                 }
-            }
+            });
+            ui.add_space(6.0);
+        }
 
-            Loaded::Pem {
-                certs,
-                key,
-                encrypted_key,
-            } => {
-                let certs = certs.clone();
-                let key = key.clone();
-                let encrypted_key = *encrypted_key;
-
-                // 單張憑證 -> DER
-                if certs.len() == 1 {
-                    let der = certs[0].clone();
-                    if ui.button("PEM → DER 憑證（.der）").clicked() {
-                        let name = format!("{}.der", self.base_name());
-                        self.save_bytes(&name, "DER 憑證", &["der", "cer"], &der);
-                    }
+        // 憑證
+        if !items.certs.is_empty() {
+            ui.label(egui::RichText::new("憑證").strong());
+            ui.horizontal_wrapped(|ui| {
+                if ui.button("憑證 → PEM（.crt）").clicked() {
+                    action = Some(Action::SaveCertPem);
                 }
-
-                // 私鑰格式互轉
-                if let Some(k) = &key {
-                    let kind = k.kind;
-                    let k = k.clone();
-                    if ui.button(key_convert_button_label(kind)).clicked() {
-                        match convert_key_to_other_pem(&k) {
-                            Ok((label, pem)) => {
-                                let name = format!(
-                                    "{}-{}.key",
-                                    self.base_name(),
-                                    match kind {
-                                        KeyKind::Pkcs8 => "pkcs1",
-                                        _ => "pkcs8",
-                                    }
-                                );
-                                self.ok(format!("已轉為 {label}"));
-                                self.save_bytes(
-                                    &name,
-                                    "私鑰 (PEM)",
-                                    &["key", "pem"],
-                                    pem.as_bytes(),
-                                );
-                            }
-                            Err(e) => self.err(format!("{e}")),
-                        }
-                    }
+                if ui.button("憑證 → DER（.der）").clicked() {
+                    action = Some(Action::SaveCertDer);
                 }
-
-                // 憑證 + 私鑰 -> PFX
-                if !certs.is_empty() && key.is_some() {
-                    ui.add_space(6.0);
-                    ui.group(|ui| {
-                        ui.label(egui::RichText::new("打包成 PFX / PKCS#12").strong());
-                        ui.horizontal(|ui| {
-                            ui.label("設定密碼：");
-                            ui.add(
-                                egui::TextEdit::singleline(&mut self.out_password)
-                                    .password(true)
-                                    .desired_width(240.0),
-                            );
-                        });
-                        ui.horizontal(|ui| {
-                            ui.label("加密方式：");
-                            ui.radio_value(&mut self.legacy, false, "現代 (AES-256)");
-                            ui.radio_value(&mut self.legacy, true, "舊式相容 (3DES)");
-                        });
-                        ui.label(
-                            egui::RichText::new(
-                                "提示：匯入到較舊的系統（舊版 IIS/Java/網路設備）若失敗，改用「舊式相容」再試一次。",
-                            )
-                            .small()
-                            .color(egui::Color32::from_rgb(140, 140, 140)),
-                        );
-
-                        if ui.button("📦 產生 PFX（.pfx）").clicked() {
-                            if self.out_password.is_empty() {
-                                self.err("請先設定 PFX 密碼");
-                            } else {
-                                let k = key.as_ref().unwrap().clone();
-                                match build_pfx(&certs, &k, &self.out_password, self.legacy) {
-                                    Ok(bytes) => {
-                                        let name = format!("{}.pfx", self.base_name());
-                                        self.save_bytes(&name, "PFX", &["pfx", "p12"], &bytes);
-                                    }
-                                    Err(e) => self.err(format!("{e}")),
-                                }
-                            }
-                        }
-                    });
-                }
-
-                if encrypted_key {
-                    ui.label(
-                        egui::RichText::new(
-                            "⚠ 偵測到「加密的」PEM 私鑰（ENCRYPTED PRIVATE KEY）。請先用 openssl 解密後再載入。",
+                if items.certs.len() > 1 {
+                    if ui
+                        .button("中繼憑證鏈（chain.crt）")
+                        .on_hover_text(
+                            "不含葉憑證的中繼/根憑證，Apache 的 SSLCertificateChainFile 用",
                         )
-                        .color(egui::Color32::from_rgb(170, 90, 40)),
-                    );
+                        .clicked()
+                    {
+                        action = Some(Action::SaveChain);
+                    }
+                    if ui
+                        .button("完整憑證鏈（fullchain.crt）")
+                        .on_hover_text("葉憑證＋中繼憑證，Nginx 的 ssl_certificate 用")
+                        .clicked()
+                    {
+                        action = Some(Action::SaveFullchain);
+                    }
                 }
-
-                if certs.is_empty() && key.is_none() {
-                    ui.label("這個 PEM 沒有可轉換的內容。");
-                }
+            });
+            if items.certs.len() > 1 {
+                ui.label(
+                    egui::RichText::new("僅轉換葉憑證（第一張）；憑證鏈已依簽發順序自動排列。")
+                        .small()
+                        .color(GRAY),
+                );
             }
         }
+
+        // 私鑰
+        if let Some(key) = &items.key {
+            ui.add_space(4.0);
+            ui.label(egui::RichText::new(format!("私鑰（{}）", key_alg(key).label())).strong());
+            ui.horizontal_wrapped(|ui| {
+                for format in key_formats(key) {
+                    if ui
+                        .button(format!("私鑰 → {}（.key）", format.label()))
+                        .clicked()
+                    {
+                        action = Some(Action::SaveKey(format));
+                    }
+                }
+                if !items.certs.is_empty() && ui.button("私鑰＋憑證鏈合併 PEM").clicked() {
+                    action = Some(Action::SaveBundle);
+                }
+            });
+            ui.label(
+                egui::RichText::new("⚠ 輸出的私鑰檔「未加密」，請妥善保管。")
+                    .small()
+                    .color(ORANGE),
+            );
+        }
+
+        // 憑證 + 私鑰 -> PFX
+        if !items.certs.is_empty() && items.key.is_some() {
+            ui.add_space(6.0);
+            ui.group(|ui| {
+                ui.label(egui::RichText::new("打包成 PFX / PKCS#12").strong());
+                Self::password_field(ui, "設定密碼：", &mut self.out_password, self.show_password);
+                Self::password_field(ui, "確認密碼：", &mut self.out_password2, self.show_password);
+                ui.checkbox(&mut self.show_password, "顯示密碼");
+                ui.horizontal(|ui| {
+                    ui.label("加密方式：");
+                    ui.radio_value(&mut self.legacy, false, "現代 (AES-256)");
+                    ui.radio_value(&mut self.legacy, true, "舊式相容 (3DES)");
+                });
+                ui.label(
+                    egui::RichText::new(
+                        "提示：匯入到較舊的系統（舊版 IIS/Java/網路設備）若失敗，改用「舊式相容」再試一次。",
+                    )
+                    .small()
+                    .color(GRAY),
+                );
+
+                if ui.button("📦 產生 PFX（.pfx）").clicked() {
+                    action = Some(Action::BuildPfx);
+                }
+            });
+        }
+
+        if items.certs.is_empty() && items.key.is_none() && items.encrypted_key.is_none() {
+            ui.label("沒有可轉換的內容。");
+        }
+        action
     }
 
     fn status_panel(&mut self, ui: &mut egui::Ui) {
@@ -463,12 +691,11 @@ impl App {
         });
         // 由新到舊顯示
         for (is_err, msg) in self.status.iter().rev() {
-            let color = if *is_err {
-                egui::Color32::from_rgb(190, 60, 60)
+            let (color, prefix) = if *is_err {
+                (RED, "✖ ")
             } else {
-                egui::Color32::from_rgb(40, 130, 70)
+                (GREEN, "✔ ")
             };
-            let prefix = if *is_err { "✖ " } else { "✔ " };
             ui.colored_label(color, format!("{prefix}{msg}"));
         }
     }

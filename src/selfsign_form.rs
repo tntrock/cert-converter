@@ -1,6 +1,8 @@
 //! 「建立自簽憑證」表單視窗。只負責表單狀態與繪製；產生工作由 main.rs 在背景執行緒執行。
 
-use crate::selfsign::{validate, KeyType, SelfSignRequest, LONG_VALIDITY_WARN_DAYS, MAX_DAYS};
+use crate::selfsign::{
+    cn_san_hint, validate, KeyType, SelfSignRequest, LONG_VALIDITY_WARN_DAYS, MAX_DAYS,
+};
 use crate::{ORANGE, RED};
 
 #[derive(Default)]
@@ -12,15 +14,17 @@ pub struct SelfSignForm {
 
 impl SelfSignForm {
     /// 繪製表單。按下「產生」且驗證通過時回傳要送出的請求。
-    /// `busy` 為 true（產生中）時停用所有欄位、不允許關閉，並顯示「產生中…」。
+    /// `busy` 為 true（產生中）時停用所有欄位、隱藏關閉按鈕，並顯示「產生中…」。
     pub fn show(&mut self, ctx: &egui::Context, busy: bool) -> Option<SelfSignRequest> {
         if !self.open {
             return None;
         }
         let mut submit = None;
         let mut open = true;
-        egui::Window::new("建立自簽憑證")
-            .open(&mut open)
+        let window = egui::Window::new("建立自簽憑證");
+        // 產生中不顯示右上角的 X（按了也不能關閉，不如不給）
+        let window = if busy { window } else { window.open(&mut open) };
+        window
             .collapsible(false)
             .resizable(false)
             .default_width(480.0)
@@ -90,6 +94,9 @@ impl SelfSignForm {
                         });
                 });
 
+                if let Some(hint) = cn_san_hint(&self.request.common_name) {
+                    ui.colored_label(ORANGE, format!("⚠ {hint}"));
+                }
                 if self.request.days > LONG_VALIDITY_WARN_DAYS {
                     ui.colored_label(
                         ORANGE,

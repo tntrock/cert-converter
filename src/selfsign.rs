@@ -171,6 +171,21 @@ fn is_valid_dns_name(name: &str) -> bool {
     })
 }
 
+/// CN 看起來像主機名稱或 IP（含 `.` 或 `:`、沒有空白）卻不合法時，回傳提示文字：
+/// 這種 CN 不會自動加入 SAN，瀏覽器也就不會接受這個名稱。一般描述文字不提示。
+pub fn cn_san_hint(common_name: &str) -> Option<String> {
+    let cn = common_name.trim();
+    let hostname_like =
+        (cn.contains('.') || cn.contains(':')) && !cn.chars().any(char::is_whitespace);
+    if hostname_like && parse_san(cn).is_err() {
+        Some(format!(
+            "CN「{cn}」不是有效的主機名稱或 IP，不會加入主體別名 (SAN)；瀏覽器不會接受這個名稱"
+        ))
+    } else {
+        None
+    }
+}
+
 /// 由 CN 產生預設的存檔檔名（不含副檔名），Windows 不允許的字元以 `_` 取代。
 pub fn default_file_stem(common_name: &str) -> String {
     let stem: String = common_name
@@ -185,7 +200,17 @@ pub fn default_file_stem(common_name: &str) -> String {
         })
         .collect();
     if stem.is_empty() {
-        "selfsigned".to_string()
+        return "selfsigned".to_string();
+    }
+    // Windows 保留裝置名稱（CON、NUL、COM1…）不能當檔名，判斷的是第一個 . 之前的部分
+    let (base, rest) = stem.split_at(stem.find('.').unwrap_or(stem.len()));
+    let upper = base.to_ascii_uppercase();
+    let reserved = matches!(upper.as_str(), "CON" | "PRN" | "AUX" | "NUL")
+        || ((upper.starts_with("COM") || upper.starts_with("LPT"))
+            && upper.len() == 4
+            && matches!(upper.as_bytes()[3], b'1'..=b'9'));
+    if reserved {
+        format!("{base}_{rest}")
     } else {
         stem
     }

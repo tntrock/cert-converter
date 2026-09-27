@@ -426,6 +426,16 @@ p384 = { version = "0.13", features = ["pkcs8", "ecdsa"] }   # EC(P-384)
 x509-cert = { version = "0.2", features = ["builder", "hazmat"] }  # 組裝自簽憑證
 ```
 
+並在 `# 發行版建置最佳化` 那段 `[profile.release]` 之前加入（沿用 code-signer 的做法：RSA 金鑰產生在未最佳化時非常慢，
+開發與測試時也最佳化相依套件，RSA 3072/4096 測試才能放進一般 `cargo test` 與 CI）：
+
+```toml
+# 開發/測試時也最佳化相依套件：RSA 金鑰產生在未最佳化時非常慢
+[profile.dev.package."*"]
+opt-level = 2
+
+```
+
 `src/certcore.rs`：
 
 ```rust
@@ -536,15 +546,12 @@ fn generates_ec_p384() {
     check_generated(KeyType::EcP384, false);
 }
 
-// debug 模式下產生 RSA 3072/4096 很慢，手動執行：cargo test --release -- --ignored
 #[test]
-#[ignore]
 fn generates_rsa_3072() {
     check_generated(KeyType::Rsa3072, true);
 }
 
 #[test]
-#[ignore]
 fn generates_rsa_4096() {
     check_generated(KeyType::Rsa4096, true);
 }
@@ -811,10 +818,7 @@ impl<T: AssociatedOid + Encode> AsExtension for NonCritical<T> {
 - [ ] **Step 5: 執行測試確認通過**
 
 Run: `cargo test selfsign`
-Expected: `test result: ok. 18 passed; 0 failed; 2 ignored`。
-
-Run: `cargo test --release selfsign -- --ignored`
-Expected: `generates_rsa_3072`、`generates_rsa_4096` 通過。
+Expected: `test result: ok. 20 passed; 0 failed`（RSA 4096 約數秒）。
 
 Run: `cargo test`
 Expected: 既有 19 個 certcore 測試仍全數通過。
@@ -1162,7 +1166,7 @@ struct PendingGenerate {
 - [ ] **Step 3: 編譯與靜態檢查**
 
 Run: `cargo fmt && cargo clippy --all-targets -- -D warnings && cargo test`
-Expected: 無警告；所有測試通過（certcore 19 + selfsign 18，2 ignored）。
+Expected: 無警告；所有測試通過（certcore 19 + selfsign 20）。
 
 - [ ] **Step 4: 手動檢查表單畫面**
 
@@ -1178,7 +1182,7 @@ Expected: 無警告；所有測試通過（certcore 19 + selfsign 18，2 ignored
 
 - [ ] **Step 5: 手動檢查產生中拖放**
 
-`cargo run --release` 以外的 debug 版產生 RSA 4096 約需數秒到十數秒：開表單、選 RSA 4096、按產生，產生期間把 `tests/fixtures/rsa.crt` 拖進視窗。
+產生 RSA 4096 約需數秒（相依已最佳化；若太快來不及拖放，可連續按幾次產生再拖）：開表單、選 RSA 4096、按產生，產生期間把 `tests/fixtures/rsa.crt` 拖進視窗。
 Expected: 訊息區出現「✖ 自簽憑證產生中，請稍候再載入檔案」；產生完成後主畫面顯示新產生的憑證。
 
 - [ ] **Step 6: Commit**

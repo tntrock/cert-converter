@@ -123,7 +123,8 @@ pub fn generate(req: &SelfSignRequest) -> Result<Items>;
 
 單元測試（`src/selfsign/tests.rs`）：
 
-- 每種金鑰類型各產生一次（RSA 3072/4096 在 debug 下很慢，這兩種只驗證 2048，3072/4096 以 `#[ignore]` 標記、手動執行）：
+- 每種金鑰類型各產生一次（`Cargo.toml` 加入 `[profile.dev.package."*"] opt-level = 2`，
+  讓 RSA 3072/4096 在 debug 測試中也夠快，全部放進一般 `cargo test`；此做法沿用自 code-signer 專案）：
   - `x509-parser` 解析成功；Subject = Issuer；CN、O 正確
   - SAN 含預期的 DNS 與 IP（IPv4、IPv6）
   - 有效期 ≈ 指定天數（允許 5 分鐘誤差）

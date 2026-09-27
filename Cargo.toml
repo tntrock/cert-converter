@@ -1,9 +1,9 @@
 [package]
 name = "cert-converter"
-version = "1.2.0"
+version = "1.2.1"
 edition = "2021"
 rust-version = "1.88"
-authors = ["AllenYen <https://github.com/tntrock>"]
+authors = ["Allen Yen <https://allenyen.net>"]
 description = "憑證格式轉換工具 - 純 Rust、離線、免安裝的 Windows GUI"
 license = "MIT"
 repository = "https://github.com/tntrock/cert-converter"

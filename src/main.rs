@@ -407,8 +407,8 @@ impl eframe::App for App {
 
 // ---- 關於 ----
 const VERSION: &str = env!("CARGO_PKG_VERSION");
-const AUTHOR: &str = "AllenYen";
-const AUTHOR_URL: &str = "https://github.com/tntrock";
+const AUTHOR: &str = "Allen Yen";
+const AUTHOR_URL: &str = "https://allenyen.net";
 const REPO_URL: &str = env!("CARGO_PKG_REPOSITORY");
 const RELEASES_URL: &str = concat!(env!("CARGO_PKG_REPOSITORY"), "/releases");
 const ISSUES_URL: &str = concat!(env!("CARGO_PKG_REPOSITORY"), "/issues");
@@ -736,7 +736,7 @@ impl App {
                     .spacing([12.0, 6.0])
                     .show(ui, |ui| {
                         ui.label(egui::RichText::new("作者").strong());
-                        ui.hyperlink_to(format!("{AUTHOR}（@tntrock）"), AUTHOR_URL);
+                        ui.hyperlink_to(AUTHOR, AUTHOR_URL);
                         ui.end_row();
                         ui.label(egui::RichText::new("專案首頁").strong());
                         ui.hyperlink_to(REPO_URL, REPO_URL);

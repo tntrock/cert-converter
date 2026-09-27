@@ -109,7 +109,7 @@ pub struct LoadedKey {
 }
 
 impl LoadedKey {
-    fn new(kind: KeyKind, der: &[u8]) -> Self {
+    pub(crate) fn new(kind: KeyKind, der: &[u8]) -> Self {
         LoadedKey {
             kind,
             der: Zeroizing::new(der.to_vec()),
@@ -138,6 +138,7 @@ pub enum Source {
     DerKey,
     Pkcs7,
     Pfx,
+    Generated,
 }
 
 /// 已解開、可直接轉換的內容
@@ -172,7 +173,7 @@ impl Loaded {
 }
 
 impl Items {
-    fn new(source: Source) -> Self {
+    pub(crate) fn new(source: Source) -> Self {
         Items {
             source,
             certs: Vec::new(),
@@ -189,6 +190,7 @@ impl Items {
             Source::DerKey => "DER 私鑰",
             Source::Pkcs7 => "PKCS#7 (.p7b)",
             Source::Pfx => "PFX（已解鎖）",
+            Source::Generated => "新產生的自簽憑證",
         };
         let mut parts = Vec::new();
         if !self.certs.is_empty() {

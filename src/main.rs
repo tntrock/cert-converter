@@ -2,6 +2,8 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod certcore;
+#[allow(dead_code)]
+mod selfsign;
 
 use certcore::{
     build_pfx, cert_info, certs_to_pem, decrypt_key, der_to_pem, detect, export_key_pem, key_alg,

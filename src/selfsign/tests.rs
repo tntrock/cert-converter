@@ -226,6 +226,28 @@ fn invalid_entries_are_rejected_with_the_entry_in_message() {
 }
 
 #[test]
+fn mistyped_ip_is_rejected_not_treated_as_dns() {
+    // 解析不成 IP、但全為數字段的輸入不可悄悄變成 DNS 名稱
+    for bad in [
+        "192.168.1.300",
+        "10.0.0.010",
+        "192.168.001.010",
+        "1.2.3",
+        "example.123",
+    ] {
+        let err = validate(&req("x.local", bad)).unwrap_err().to_string();
+        assert!(err.contains(bad), "{bad}: {err}");
+    }
+    // 開頭或中間段是數字的正常主機名稱仍可使用
+    assert!(validate(&req(
+        "x.local",
+        "1password.local
+host1.10.local"
+    ))
+    .is_ok());
+}
+
+#[test]
 fn non_hostname_cn_is_allowed_but_needs_a_san() {
     let err = validate(&req("測試伺服器", "")).unwrap_err().to_string();
     assert!(err.contains("至少"), "{err}");

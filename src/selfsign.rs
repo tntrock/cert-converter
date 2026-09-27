@@ -152,6 +152,13 @@ fn is_valid_dns_name(name: &str) -> bool {
         return false;
     }
     let labels: Vec<&str> = name.split('.').collect();
+    // 最後一段全為數字的一定不是主機名稱，多半是打錯的 IP（例如 192.168.1.300），不可悄悄當成 DNS
+    if labels
+        .last()
+        .is_some_and(|l| l.chars().all(|c| c.is_ascii_digit()))
+    {
+        return false;
+    }
     labels.iter().enumerate().all(|(i, label)| {
         if *label == "*" {
             return i == 0 && labels.len() > 1;

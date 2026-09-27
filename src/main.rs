@@ -7,6 +7,7 @@ use certcore::{
     build_pfx, cert_info, certs_to_pem, decrypt_key, der_to_pem, detect, export_key_pem, key_alg,
     key_formats, pem_bundle, unlock_pfx, CertInfo, KeyFormat, Loaded,
 };
+use sha2::{Digest, Sha256};
 use std::path::{Path, PathBuf};
 use zeroize::Zeroizing;
 
@@ -26,7 +27,7 @@ fn main() -> eframe::Result<()> {
             setup_fonts(&cc.egui_ctx);
             let mut app = App::default();
             // 支援「把檔案拖到 exe 上」或「開啟檔案的程式」：第一個參數為檔案路徑
-            if let Some(path) = std::env::args_os().nth(1) {
+            if let Some(path) = std::env::args_os().nth(1).filter(|p| !p.is_empty()) {
                 app.load_file(Path::new(&path));
             }
             Ok(Box::new(app))
@@ -107,7 +108,9 @@ struct App {
     out_password: Zeroizing<String>,  // 產生 PFX 時的密碼
     out_password2: Zeroizing<String>, // 再次輸入確認
     show_password: bool,
-    legacy: bool, // PFX 輸出：是否使用舊式相容加密
+    show_about: bool,
+    exe_sha256: Option<String>, // 目前執行檔的 SHA-256（開啟「關於」時才計算）
+    legacy: bool,               // PFX 輸出：是否使用舊式相容加密
 
     // 狀態訊息（is_error, 內容）
     status: Vec<(bool, String)>,
@@ -395,10 +398,32 @@ impl eframe::App for App {
                 self.status_panel(ui);
             });
         });
+        self.about_window(ctx);
         if let Some(action) = action {
             self.run(action);
         }
     }
+}
+
+// ---- 關於 ----
+const VERSION: &str = env!("CARGO_PKG_VERSION");
+const AUTHOR: &str = "AllenYen";
+const AUTHOR_URL: &str = "https://github.com/tntrock";
+const REPO_URL: &str = env!("CARGO_PKG_REPOSITORY");
+const RELEASES_URL: &str = concat!(env!("CARGO_PKG_REPOSITORY"), "/releases");
+const ISSUES_URL: &str = concat!(env!("CARGO_PKG_REPOSITORY"), "/issues");
+
+/// 計算目前執行檔的 SHA-256，供使用者與 Release 頁面的 SHA256SUMS.txt 比對。
+fn exe_sha256() -> String {
+    std::env::current_exe()
+        .and_then(std::fs::read)
+        .map(|bytes| {
+            Sha256::digest(bytes)
+                .iter()
+                .map(|b| format!("{b:02x}"))
+                .collect()
+        })
+        .unwrap_or_else(|e| format!("無法計算：{e}"))
 }
 
 const GRAY: egui::Color32 = egui::Color32::from_rgb(140, 140, 140);
@@ -409,7 +434,15 @@ const RED: egui::Color32 = egui::Color32::from_rgb(190, 60, 60);
 // ---- UI 區塊 ----
 impl App {
     fn header(&mut self, ui: &mut egui::Ui) {
-        ui.heading("🔐 憑證格式轉換工具");
+        ui.horizontal(|ui| {
+            ui.heading("🔐 憑證格式轉換工具");
+            ui.label(egui::RichText::new(format!("v{VERSION}")).weak());
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if ui.button("ℹ 關於").clicked() {
+                    self.show_about = true;
+                }
+            });
+        });
         ui.label(
             egui::RichText::new("純離線運作 · 私鑰僅存於記憶體、不寫暫存檔 · 免安裝單一執行檔")
                 .small()
@@ -676,6 +709,80 @@ impl App {
             ui.label("沒有可轉換的內容。");
         }
         action
+    }
+
+    fn about_window(&mut self, ctx: &egui::Context) {
+        if !self.show_about {
+            return;
+        }
+        if self.exe_sha256.is_none() {
+            self.exe_sha256 = Some(exe_sha256());
+        }
+        let mut open = true;
+        egui::Window::new("關於")
+            .open(&mut open)
+            .collapsible(false)
+            .resizable(false)
+            .default_width(520.0)
+            .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0))
+            .show(ctx, |ui| {
+                ui.heading("🔐 憑證格式轉換工具（cert-converter）");
+                ui.label(format!("版本 v{VERSION}"));
+                ui.label("純 Rust、完全離線、免安裝的 Windows 憑證格式轉換工具。");
+                ui.add_space(8.0);
+
+                egui::Grid::new("about_grid")
+                    .num_columns(2)
+                    .spacing([12.0, 6.0])
+                    .show(ui, |ui| {
+                        ui.label(egui::RichText::new("作者").strong());
+                        ui.hyperlink_to(format!("{AUTHOR}（@tntrock）"), AUTHOR_URL);
+                        ui.end_row();
+                        ui.label(egui::RichText::new("專案首頁").strong());
+                        ui.hyperlink_to(REPO_URL, REPO_URL);
+                        ui.end_row();
+                        ui.label(egui::RichText::new("官方下載").strong());
+                        ui.hyperlink_to(RELEASES_URL, RELEASES_URL);
+                        ui.end_row();
+                        ui.label(egui::RichText::new("問題回報").strong());
+                        ui.hyperlink_to(ISSUES_URL, ISSUES_URL);
+                        ui.end_row();
+                        ui.label(egui::RichText::new("授權").strong());
+                        ui.label("MIT License");
+                        ui.end_row();
+                    });
+
+                ui.add_space(10.0);
+                ui.group(|ui| {
+                    ui.label(
+                        egui::RichText::new("⚠ 請只從官方 GitHub Releases 下載")
+                            .strong()
+                            .color(ORANGE),
+                    );
+                    ui.label(
+                        "本工具會處理私鑰，來路不明的版本可能被植入惡意程式。\n\
+                         官方執行檔只發佈在上方的「官方下載」頁面，檔名為\n\
+                         cert-converter-vX.Y.Z-windows-x64.exe，並附上 SHA256SUMS.txt。",
+                    );
+                    ui.add_space(4.0);
+                    ui.label("目前這個執行檔的 SHA-256（應與 SHA256SUMS.txt 內的值相同）：");
+                    let hash = self.exe_sha256.as_deref().unwrap_or_default();
+                    ui.horizontal(|ui| {
+                        ui.add(egui::Label::new(egui::RichText::new(hash).monospace()).wrap());
+                        if ui.small_button("📋 複製").clicked() {
+                            ui.ctx().copy_text(hash.to_string());
+                        }
+                    });
+                });
+
+                ui.add_space(6.0);
+                ui.label(
+                    egui::RichText::new("點選連結會以預設瀏覽器開啟；除此之外本工具不會連線。")
+                        .small()
+                        .color(GRAY),
+                );
+            });
+        self.show_about = open;
     }
 
     fn status_panel(&mut self, ui: &mut egui::Ui) {

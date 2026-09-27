@@ -18,6 +18,9 @@
   ```powershell
   Get-FileHash .\cert-converter-*.exe -Algorithm SHA256
   ```
+- 程式右上角的「ℹ 關於」會顯示版本、作者、官方下載網址，以及**目前執行檔的 SHA-256**，
+  可直接和 Release 頁面的 `SHA256SUMS.txt` 比對，確認拿到的是官方版本。
+- 本工具會處理私鑰，**請只從上方的官方 Releases 頁面下載**，不要使用來路不明的轉貼版本。
 - 執行檔沒有數位簽章，第一次執行時 Windows SmartScreen 可能顯示「Windows 已保護您的電腦」，
   按「其他資訊」→「仍要執行」即可。若有疑慮，可依下方步驟自行從原始碼建置。
 

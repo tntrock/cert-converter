@@ -114,7 +114,7 @@ fn wildcard_cn_becomes_san() {
 }
 
 #[test]
-fn max_validity_after_2049_uses_generalized_time() {
+fn max_validity_days_left_is_correct() {
     let mut req = full_req(KeyType::EcP256);
     req.days = MAX_DAYS;
     let items = generate(&req).unwrap();
@@ -280,6 +280,38 @@ fn days_range() {
         let mut r = req("a.local", "");
         r.days = days;
         assert_eq!(validate(&r).is_ok(), ok, "{days}");
+    }
+}
+
+#[test]
+fn default_file_stem_avoids_windows_reserved_names() {
+    assert_eq!(default_file_stem("CON"), "CON_");
+    assert_eq!(default_file_stem("nul"), "nul_");
+    assert_eq!(default_file_stem("com1"), "com1_");
+    assert_eq!(default_file_stem("LPT9"), "LPT9_");
+    // Windows 只看第一個 . 之前的部分
+    assert_eq!(default_file_stem("aux.example.local"), "aux_.example.local");
+    // 只是開頭相同的一般名稱不受影響
+    assert_eq!(default_file_stem("console.local"), "console.local");
+    assert_eq!(default_file_stem("com10"), "com10");
+}
+
+#[test]
+fn cn_hint_warns_when_hostname_like_cn_is_not_valid() {
+    let hint = cn_san_hint("file_server.corp").unwrap();
+    assert!(hint.contains("file_server.corp"), "{hint}");
+    assert!(cn_san_hint("192.168.1.300").is_some());
+    // 合法的主機名稱或 IP、以及一般描述文字都不提示
+    for ok in [
+        "server.local",
+        "*.example.local",
+        "10.0.0.1",
+        "::1",
+        "測試伺服器",
+        "My Server",
+        "",
+    ] {
+        assert_eq!(cn_san_hint(ok), None, "{ok}");
     }
 }
 

@@ -252,11 +252,14 @@ impl App {
         match pending.rx.try_recv() {
             Err(TryRecvError::Empty) => ctx.request_repaint_after(Duration::from_millis(100)),
             Err(TryRecvError::Disconnected) => {
+                // 狀態在表單畫完之後才改變，主動要求重繪，不依賴轉圈動畫順便觸發
+                ctx.request_repaint();
                 self.pending = None;
                 self.selfsign_form.error = Some("產生失敗（背景工作意外中止）".to_string());
                 self.err("自簽憑證產生失敗（背景工作意外中止）");
             }
             Ok(result) => {
+                ctx.request_repaint();
                 let file_stem = self.pending.take().map(|p| p.file_stem).unwrap_or_default();
                 match result {
                     Ok(items) => {

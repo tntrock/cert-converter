@@ -2,15 +2,18 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod certcore;
-#[allow(dead_code)]
 mod selfsign;
+mod selfsign_form;
 
 use certcore::{
     build_pfx, cert_info, certs_to_pem, decrypt_key, der_to_pem, detect, export_key_pem, key_alg,
-    key_formats, pem_bundle, unlock_pfx, CertInfo, KeyFormat, Loaded,
+    key_formats, pem_bundle, unlock_pfx, CertInfo, Items, KeyFormat, Loaded,
 };
+use selfsign_form::SelfSignForm;
 use sha2::{Digest, Sha256};
 use std::path::{Path, PathBuf};
+use std::sync::mpsc::{self, Receiver, TryRecvError};
+use std::time::Duration;
 use zeroize::Zeroizing;
 
 fn main() -> eframe::Result<()> {
@@ -82,6 +85,13 @@ type Output = (
     Zeroizing<Vec<u8>>,
 );
 
+/// 背景產生自簽憑證的工作
+struct PendingGenerate {
+    /// 產生完成後使用的預設檔名
+    file_stem: String,
+    rx: Receiver<anyhow::Result<Items>>,
+}
+
 enum Action {
     PickFile,
     Clear,
@@ -112,7 +122,10 @@ struct App {
     show_password: bool,
     show_about: bool,
     exe_sha256: Option<String>, // 目前執行檔的 SHA-256（開啟「關於」時才計算）
-    legacy: bool,               // PFX 輸出：是否使用舊式相容加密
+    selfsign_form: SelfSignForm,
+    pending: Option<PendingGenerate>,
+    generated_stem: Option<String>, // 自簽憑證的預設檔名（沒有來源檔案時使用）
+    legacy: bool,                   // PFX 輸出：是否使用舊式相容加密
 
     // 狀態訊息（is_error, 內容）
     status: Vec<(bool, String)>,
@@ -127,6 +140,7 @@ impl App {
     }
 
     fn reset(&mut self) {
+        self.generated_stem = None;
         self.loaded = None;
         self.info = None;
         self.info_note = None;
@@ -218,12 +232,58 @@ impl App {
             .as_ref()
             .and_then(|f| f.file_stem())
             .map(|s| s.to_string_lossy().to_string())
+            .or_else(|| self.generated_stem.clone())
             .unwrap_or_else(|| "output".to_string())
+    }
+
+    fn start_generate(&mut self, request: selfsign::SelfSignRequest) {
+        let (tx, rx) = mpsc::channel();
+        let file_stem = selfsign::default_file_stem(&request.common_name);
+        std::thread::spawn(move || {
+            let _ = tx.send(selfsign::generate(&request));
+        });
+        self.pending = Some(PendingGenerate { file_stem, rx });
+    }
+
+    fn poll_generate(&mut self, ctx: &egui::Context) {
+        let Some(pending) = &self.pending else {
+            return;
+        };
+        match pending.rx.try_recv() {
+            Err(TryRecvError::Empty) => ctx.request_repaint_after(Duration::from_millis(100)),
+            Err(TryRecvError::Disconnected) => {
+                self.pending = None;
+                self.selfsign_form.error = Some("產生失敗（背景工作意外中止）".to_string());
+                self.err("自簽憑證產生失敗（背景工作意外中止）");
+            }
+            Ok(result) => {
+                let file_stem = self.pending.take().map(|p| p.file_stem).unwrap_or_default();
+                match result {
+                    Ok(items) => {
+                        self.reset();
+                        self.file_path = None;
+                        self.generated_stem = Some(file_stem);
+                        self.selfsign_form.open = false;
+                        self.selfsign_form.error = None;
+                        self.ok("已產生自簽憑證；私鑰尚未儲存，請記得匯出");
+                        self.set_loaded(Loaded::Items(items));
+                    }
+                    Err(e) => {
+                        self.selfsign_form.error = Some(e.to_string());
+                        self.err(format!("自簽憑證產生失敗：{e}"));
+                    }
+                }
+            }
+        }
     }
 
     fn run(&mut self, action: Action) {
         match action {
             Action::PickFile => {
+                if self.pending.is_some() {
+                    self.err("自簽憑證產生中，請稍候再載入檔案");
+                    return;
+                }
                 if let Some(path) = rfd::FileDialog::new()
                     .add_filter(
                         "憑證/金鑰",
@@ -384,7 +444,11 @@ impl eframe::App for App {
                 .find_map(|f| f.path.clone())
         });
         if let Some(path) = dropped {
-            self.load_file(&path);
+            if self.pending.is_some() {
+                self.err("自簽憑證產生中，請稍候再載入檔案");
+            } else {
+                self.load_file(&path);
+            }
         }
 
         let mut action = None;
@@ -400,6 +464,10 @@ impl eframe::App for App {
                 self.status_panel(ui);
             });
         });
+        if let Some(request) = self.selfsign_form.show(ctx, self.pending.is_some()) {
+            self.start_generate(request);
+        }
+        self.poll_generate(ctx);
         self.about_window(ctx);
         if let Some(action) = action {
             self.run(action);
@@ -442,6 +510,9 @@ impl App {
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 if ui.button("ℹ 關於").clicked() {
                     self.show_about = true;
+                }
+                if ui.button("✨ 建立自簽憑證").clicked() {
+                    self.selfsign_form.open = true;
                 }
             });
         });

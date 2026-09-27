@@ -1,8 +1,34 @@
 //! 建立自簽憑證（離線）：驗證表單、產生私鑰與 X.509 v3 自簽伺服器憑證。
 
 use std::net::IpAddr;
+use std::time::{Duration, SystemTime};
 
-use anyhow::{bail, Result};
+use anyhow::{anyhow, bail, Result};
+use rsa::pkcs8::EncodePrivateKey;
+use rsa::rand_core::{OsRng, RngCore};
+use rsa::signature::{Keypair, Signer};
+use rsa::RsaPrivateKey;
+use sha2::Sha256;
+use x509_cert::attr::AttributeTypeAndValue;
+use x509_cert::builder::{Builder, CertificateBuilder, Profile};
+use x509_cert::der::asn1::{Ia5String, OctetString, SetOfVec, Utf8StringRef};
+use x509_cert::der::oid::{AssociatedOid, ObjectIdentifier};
+use x509_cert::der::referenced::OwnedToRef;
+use x509_cert::der::{Any, Encode, Length, Writer};
+use x509_cert::ext::pkix::name::GeneralName;
+use x509_cert::ext::pkix::{
+    BasicConstraints, ExtendedKeyUsage, KeyUsage, KeyUsages, SubjectAltName, SubjectKeyIdentifier,
+};
+use x509_cert::ext::{AsExtension, Extension};
+use x509_cert::name::{Name, RdnSequence, RelativeDistinguishedName};
+use x509_cert::serial_number::SerialNumber;
+use x509_cert::spki::{
+    DynSignatureAlgorithmIdentifier, EncodePublicKey, SignatureBitStringEncoding,
+    SubjectPublicKeyInfoOwned,
+};
+use x509_cert::time::{Time, Validity};
+
+use crate::certcore::{Items, KeyKind, LoadedKey, Source};
 
 /// 有效天數上限
 pub const MAX_DAYS: u32 = 3650;
@@ -155,6 +181,173 @@ pub fn default_file_stem(common_name: &str) -> String {
         "selfsigned".to_string()
     } else {
         stem
+    }
+}
+
+const OID_COMMON_NAME: ObjectIdentifier = ObjectIdentifier::new_unwrap("2.5.4.3");
+const OID_ORGANIZATION: ObjectIdentifier = ObjectIdentifier::new_unwrap("2.5.4.10");
+const OID_SERVER_AUTH: ObjectIdentifier = ObjectIdentifier::new_unwrap("1.3.6.1.5.5.7.3.1");
+
+/// 產生私鑰與自簽憑證，回傳可直接載入主畫面的內容。
+/// RSA 4096 在一般電腦上可能需要數秒，請勿在 UI 執行緒呼叫。
+pub fn generate(req: &SelfSignRequest) -> Result<Items> {
+    let sans = validate(req)?;
+    let subject = subject_name(req.common_name.trim(), req.organization.trim())?;
+
+    let (pkcs8, cert) = match req.key_type {
+        KeyType::Rsa2048 => rsa_material(2048, subject, &sans, req.days)?,
+        KeyType::Rsa3072 => rsa_material(3072, subject, &sans, req.days)?,
+        KeyType::Rsa4096 => rsa_material(4096, subject, &sans, req.days)?,
+        KeyType::EcP256 => {
+            let signer = p256::ecdsa::SigningKey::random(&mut OsRng);
+            let pkcs8 = signer
+                .to_pkcs8_der()
+                .map_err(|e| anyhow!("私鑰編碼失敗：{e}"))?;
+            let cert = build_cert::<_, p256::ecdsa::DerSignature>(
+                &signer, subject, &sans, req.days, false,
+            )?;
+            (pkcs8, cert)
+        }
+        KeyType::EcP384 => {
+            let signer = p384::ecdsa::SigningKey::random(&mut OsRng);
+            let pkcs8 = signer
+                .to_pkcs8_der()
+                .map_err(|e| anyhow!("私鑰編碼失敗：{e}"))?;
+            let cert = build_cert::<_, p384::ecdsa::DerSignature>(
+                &signer, subject, &sans, req.days, false,
+            )?;
+            (pkcs8, cert)
+        }
+    };
+
+    let mut items = Items::new(Source::Generated);
+    items.certs.push(cert);
+    items.key = Some(LoadedKey::new(KeyKind::Pkcs8, pkcs8.as_bytes()));
+    Ok(items)
+}
+
+fn rsa_material(
+    bits: usize,
+    subject: Name,
+    sans: &[San],
+    days: u32,
+) -> Result<(pkcs8::SecretDocument, Vec<u8>)> {
+    let key = RsaPrivateKey::new(&mut OsRng, bits).map_err(|e| anyhow!("RSA 金鑰產生失敗：{e}"))?;
+    let pkcs8 = key
+        .to_pkcs8_der()
+        .map_err(|e| anyhow!("私鑰編碼失敗：{e}"))?;
+    let signer = rsa::pkcs1v15::SigningKey::<Sha256>::new(key);
+    let cert = build_cert::<_, rsa::pkcs1v15::Signature>(&signer, subject, sans, days, true)?;
+    Ok((pkcs8, cert))
+}
+
+/// Subject（= Issuer）。直接組 RDN，不經過字串解析，CN/O 內的逗號、引號、中文等都會原樣保留。
+/// 編碼順序為 O、CN（顯示時多為「CN=…, O=…」）。
+fn subject_name(common_name: &str, organization: &str) -> Result<Name> {
+    let mut rdns = Vec::new();
+    if !organization.is_empty() {
+        rdns.push(rdn(OID_ORGANIZATION, organization)?);
+    }
+    rdns.push(rdn(OID_COMMON_NAME, common_name)?);
+    Ok(RdnSequence(rdns))
+}
+
+fn rdn(oid: ObjectIdentifier, value: &str) -> Result<RelativeDistinguishedName> {
+    let atv = AttributeTypeAndValue {
+        oid,
+        value: Any::from(Utf8StringRef::new(value)?),
+    };
+    Ok(RelativeDistinguishedName::from(SetOfVec::try_from(vec![
+        atv,
+    ])?))
+}
+
+fn build_cert<S, Sig>(
+    signer: &S,
+    subject: Name,
+    sans: &[San],
+    days: u32,
+    key_encipherment: bool,
+) -> Result<Vec<u8>>
+where
+    S: Keypair + DynSignatureAlgorithmIdentifier + Signer<Sig>,
+    S::VerifyingKey: EncodePublicKey,
+    Sig: SignatureBitStringEncoding,
+{
+    let spki = SubjectPublicKeyInfoOwned::from_key(signer.verifying_key())?;
+
+    // 往前推 5 分鐘，避免用戶端時鐘稍慢時出現「尚未生效」
+    let not_before = SystemTime::now() - Duration::from_secs(5 * 60);
+    let not_after = not_before + Duration::from_secs(u64::from(days) * 86_400);
+    let validity = Validity {
+        not_before: Time::try_from(not_before)?,
+        not_after: Time::try_from(not_after)?,
+    };
+
+    // 16 bytes 亂數序號；最高位元清 0 確保為正整數，次高位元設 1 確保編碼長度固定為 16
+    let mut serial = [0u8; 16];
+    OsRng.fill_bytes(&mut serial);
+    serial[0] = (serial[0] & 0x7f) | 0x40;
+
+    let mut builder = CertificateBuilder::new(
+        Profile::Manual { issuer: None },
+        SerialNumber::new(&serial)?,
+        validity,
+        subject,
+        spki.clone(),
+        signer,
+    )?;
+
+    builder.add_extension(&SubjectKeyIdentifier::try_from(spki.owned_to_ref())?)?;
+    builder.add_extension(&BasicConstraints {
+        ca: false,
+        path_len_constraint: None,
+    })?;
+    let usage = if key_encipherment {
+        KeyUsages::DigitalSignature | KeyUsages::KeyEncipherment
+    } else {
+        KeyUsages::DigitalSignature.into()
+    };
+    builder.add_extension(&KeyUsage(usage))?;
+    builder.add_extension(&NonCritical(ExtendedKeyUsage(vec![OID_SERVER_AUTH])))?;
+
+    let names = sans
+        .iter()
+        .map(|san| {
+            Ok(match san {
+                San::Dns(name) => GeneralName::DnsName(Ia5String::new(name)?),
+                San::Ip(IpAddr::V4(ip)) => GeneralName::IpAddress(OctetString::new(ip.octets())?),
+                San::Ip(IpAddr::V6(ip)) => GeneralName::IpAddress(OctetString::new(ip.octets())?),
+            })
+        })
+        .collect::<Result<Vec<_>>>()?;
+    builder.add_extension(&SubjectAltName(names))?;
+
+    let cert = builder.build::<Sig>()?;
+    Ok(cert.to_der()?)
+}
+
+/// `x509-cert` 會把 extendedKeyUsage 標成 critical；業界慣例（mkcert、OpenSSL 預設）為 non-critical，
+/// 部分舊軟體遇到 critical EKU 會拒絕憑證，因此包一層強制 non-critical。
+struct NonCritical<T>(T);
+
+impl<T: AssociatedOid> AssociatedOid for NonCritical<T> {
+    const OID: ObjectIdentifier = T::OID;
+}
+
+impl<T: Encode> Encode for NonCritical<T> {
+    fn encoded_len(&self) -> x509_cert::der::Result<Length> {
+        self.0.encoded_len()
+    }
+
+    fn encode(&self, writer: &mut impl Writer) -> x509_cert::der::Result<()> {
+        self.0.encode(writer)
+    }
+}
+
+impl<T: AssociatedOid + Encode> AsExtension for NonCritical<T> {
+    fn critical(&self, _subject: &Name, _extensions: &[Extension]) -> bool {
+        false
     }
 }
 

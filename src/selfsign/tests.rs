@@ -1,5 +1,137 @@
 use super::*;
+use crate::certcore::{build_pfx, cert_info, unlock_pfx, Items, Source};
 use std::net::{Ipv4Addr, Ipv6Addr};
+use x509_parser::prelude::*;
+
+fn full_req(key_type: KeyType) -> SelfSignRequest {
+    SelfSignRequest {
+        common_name: "server.example.local".into(),
+        organization: "測試 公司".into(),
+        sans: "www.example.local\n192.168.1.10\n2001:db8::1".into(),
+        key_type,
+        days: 365,
+    }
+}
+
+fn check_generated(key_type: KeyType, is_rsa: bool) -> Items {
+    let items = generate(&full_req(key_type)).unwrap();
+    assert_eq!(items.source, Source::Generated);
+    assert_eq!(items.certs.len(), 1);
+    assert_eq!(items.key_matches_leaf(), Some(true));
+
+    let info = cert_info(&items.certs[0]).unwrap();
+    assert_eq!(info.common_name.as_deref(), Some("server.example.local"));
+    assert_eq!(info.subject, info.issuer);
+    assert!(info.subject.contains("O=測試 公司"), "{}", info.subject);
+    assert!((364..=365).contains(&info.days_left), "{}", info.days_left);
+    for san in [
+        "DNS: server.example.local",
+        "DNS: www.example.local",
+        "IP: 192.168.1.10",
+        "IP: 2001:db8::1",
+    ] {
+        assert!(info.sans.contains(&san.to_string()), "{san}");
+    }
+
+    let (_, c) = X509Certificate::from_der(&items.certs[0]).unwrap();
+    let serial = c.tbs_certificate.raw_serial();
+    assert_eq!(serial.len(), 16);
+    assert!(serial[0] < 0x80, "serial must be positive");
+
+    let bc = c.basic_constraints().unwrap().unwrap();
+    assert!(bc.critical);
+    assert!(!bc.value.ca);
+
+    let ku = c.key_usage().unwrap().unwrap();
+    assert!(ku.critical);
+    assert!(ku.value.digital_signature());
+    assert_eq!(ku.value.key_encipherment(), is_rsa);
+    assert!(!ku.value.non_repudiation());
+
+    let eku = c.extended_key_usage().unwrap().unwrap();
+    assert!(!eku.critical);
+    assert!(eku.value.server_auth);
+
+    assert!(c.extensions().iter().any(|e| matches!(
+        e.parsed_extension(),
+        ParsedExtension::SubjectKeyIdentifier(_)
+    )));
+
+    let pfx = build_pfx(&items.certs, items.key.as_ref().unwrap(), "pw", false).unwrap();
+    assert!(unlock_pfx(&pfx, "pw").is_ok());
+    items
+}
+
+#[test]
+fn generates_rsa_2048() {
+    check_generated(KeyType::Rsa2048, true);
+}
+
+#[test]
+fn generates_ec_p256() {
+    check_generated(KeyType::EcP256, false);
+}
+
+#[test]
+fn generates_ec_p384() {
+    check_generated(KeyType::EcP384, false);
+}
+
+#[test]
+fn generates_rsa_3072() {
+    check_generated(KeyType::Rsa3072, true);
+}
+
+#[test]
+fn generates_rsa_4096() {
+    check_generated(KeyType::Rsa4096, true);
+}
+
+#[test]
+fn special_characters_in_subject_are_kept() {
+    let cn = "#a, b \"c\" + d=e <f>;g\\h 中文";
+    let req = SelfSignRequest {
+        common_name: cn.into(),
+        organization: "O, \"quoted\" + 公司".into(),
+        sans: "host.local".into(),
+        key_type: KeyType::EcP256,
+        days: 30,
+    };
+    let items = generate(&req).unwrap();
+    let info = cert_info(&items.certs[0]).unwrap();
+    assert_eq!(info.common_name.as_deref(), Some(cn));
+    assert_eq!(info.sans, vec!["DNS: host.local".to_string()]);
+}
+
+#[test]
+fn wildcard_cn_becomes_san() {
+    let mut req = full_req(KeyType::EcP256);
+    req.common_name = "*.example.local".into();
+    req.sans.clear();
+    let items = generate(&req).unwrap();
+    let info = cert_info(&items.certs[0]).unwrap();
+    assert_eq!(info.sans, vec!["DNS: *.example.local".to_string()]);
+}
+
+#[test]
+fn max_validity_after_2049_uses_generalized_time() {
+    let mut req = full_req(KeyType::EcP256);
+    req.days = MAX_DAYS;
+    let items = generate(&req).unwrap();
+    let info = cert_info(&items.certs[0]).unwrap();
+    assert!(
+        (MAX_DAYS as i64 - 1..=MAX_DAYS as i64).contains(&info.days_left),
+        "{}",
+        info.days_left
+    );
+}
+
+#[test]
+fn generate_rejects_invalid_request() {
+    let mut req = full_req(KeyType::EcP256);
+    req.common_name.clear();
+    assert!(generate(&req).is_err());
+}
 
 fn req(cn: &str, sans: &str) -> SelfSignRequest {
     SelfSignRequest {

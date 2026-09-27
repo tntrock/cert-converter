@@ -23,9 +23,10 @@ p12-keystore = "0.3"              # PFX/PKCS#12 讀寫，含舊式加密支援
 x509-parser = "0.18"              # 憑證內容解析 (CN/SAN/有效期…)
 pem = "3"                         # PEM 編解碼
 sha2 = "0.10"                     # SHA-256 指紋
-rsa = "0.9"                       # RSA 私鑰 PKCS#1 <-> PKCS#8
-p256 = { version = "0.13", features = ["pkcs8"] }   # EC(P-256) SEC1 -> PKCS#8
-p384 = { version = "0.13", features = ["pkcs8"] }   # EC(P-384) SEC1 -> PKCS#8
+rsa = { version = "0.9", features = ["sha2"] }       # RSA 私鑰格式互轉、自簽憑證簽章
+p256 = { version = "0.13", features = ["pkcs8", "ecdsa"] }   # EC(P-256)
+p384 = { version = "0.13", features = ["pkcs8", "ecdsa"] }   # EC(P-384)
+x509-cert = { version = "0.2", features = ["builder", "hazmat"] }  # 組裝自簽憑證
 pkcs8 = { version = "0.10", features = ["encryption", "3des", "sha1-insecure"] }  # 加密 PKCS#8 私鑰解密
 md-5 = "0.10"                     # 舊式 OpenSSL 加密 PEM 的金鑰推導 (EVP_BytesToKey)
 aes = "0.8"
@@ -33,6 +34,10 @@ des = "0.8"
 cbc = "0.1"
 zeroize = "1"                     # 私鑰/密碼於釋放時清零
 anyhow = "1"
+
+# 開發/測試時也最佳化相依套件：RSA 金鑰產生在未最佳化時非常慢
+[profile.dev.package."*"]
+opt-level = 2
 
 # 發行版建置最佳化：更小的 exe、更快的執行速度
 [profile.release]

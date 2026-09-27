@@ -38,7 +38,7 @@
 | 金鑰類型 | RSA 2048 | RSA 2048 / RSA 3072 / RSA 4096 / EC P-256 / EC P-384 |
 | 有效天數 | 365 | 整數 1–3650；> 825 天時顯示警告（不阻擋）：「macOS / iOS 不接受效期超過 825 天的 TLS 憑證」 |
 
-DNS 名稱規則：只允許 `A-Z a-z 0-9 - . *`；`*` 只能出現在最左邊一段且整段為 `*`（如 `*.example.local`）；
+DNS 名稱規則：只允許 `A-Z a-z 0-9 - . *`（`-` 不可在一段的頭尾；DNS 名稱一律轉小寫後去重）；`*` 只能出現在最左邊一段且整段為 `*`（如 `*.example.local`）；
 每段 1–63 字元、總長 ≤ 253；不可以 `.` 開頭或結尾。
 
 CN 若不在 SAN 清單中，會自動加入（CN 可解析為 IP 時加為 IP SAN，否則依 DNS 規則驗證後加為 DNS SAN；
@@ -52,13 +52,13 @@ SAN 最終不可為空；若為空則顯示錯誤「請至少提供一個有效�
 | 項目 | 內容 |
 |---|---|
 | 版本 | X.509 v3 |
-| 序號 | 16 bytes 亂數，最高位元清 0（確保為正整數） |
+| 序號 | 16 bytes 亂數，最高位元清 0（確保為正整數）、次高位元設 1（確保 DER 編碼長度固定為 16 bytes） |
 | Subject / Issuer | 相同：`CN=<CN>`，有填組織時為 `O=<O>, CN=<CN>` |
 | 生效時間 | 目前時間 − 5 分鐘（容忍時鐘誤差） |
 | 到期時間 | 生效時間 + 有效天數 |
 | basicConstraints | critical, `CA:FALSE` |
 | keyUsage | critical；RSA：digitalSignature + keyEncipherment；EC：digitalSignature |
-| extendedKeyUsage | serverAuth |
+| extendedKeyUsage | non-critical，serverAuth（`x509-cert` 預設標 critical，需包一層強制 non-critical） |
 | subjectAltName | 依上節規則產生的 DNS / IP 清單 |
 | subjectKeyIdentifier | 公鑰的 SHA-1（RFC 5280 方法 1） |
 | 簽章演算法 | RSA：sha256WithRSAEncryption（PKCS#1 v1.5）；P-256：ecdsa-with-SHA256；P-384：ecdsa-with-SHA384 |
@@ -90,14 +90,15 @@ pub fn generate(req: &SelfSignRequest) -> Result<Items>;
 ```
 
 - 金鑰產生：`rsa::RsaPrivateKey::new(&mut OsRng, bits)`、`p256/p384::SecretKey::random(&mut OsRng)`。
-- 憑證組裝：`x509_cert::builder::CertificateBuilder`（`Profile::Manual { issuer: None }`，自行加入上表擴充欄位），
+- 憑證組裝：`x509_cert::builder::CertificateBuilder`（`Profile::Manual { issuer: None }`，需 `hazmat` feature；`Profile::Leaf` 會多加 nonRepudiation，故不用），
+  Subject 直接組成 `RdnSequence`（UTF8String），不經字串解析，特殊字元與中文原樣保留，
   簽章器為 `rsa::pkcs1v15::SigningKey<Sha256>`、`p256::ecdsa::SigningKey`、`p384::ecdsa::SigningKey`。
 - 私鑰以 PKCS#8 DER 存入 `LoadedKey { kind: KeyKind::Pkcs8, der: Zeroizing<..> }`。
-- `certcore::Source` 新增 `Generated` 變體，`type_label` 顯示「自簽憑證（新產生）」。
+- `certcore::Source` 新增 `Generated` 變體，`type_label` 顯示「新產生的自簽憑證（1 張憑證 + PKCS#8 私鑰）」。
 
 ### 相依套件
 
-- 新增 `x509-cert = { version = "0.2", features = ["builder"] }`（與現有 `rsa 0.9`、`p256/p384 0.13`、`pkcs8 0.10` 同一代 RustCrypto）
+- 新增 `x509-cert = { version = "0.2", features = ["builder", "hazmat"] }`（與現有 `rsa 0.9`、`p256/p384 0.13`、`pkcs8 0.10` 同一代 RustCrypto）
 - `rsa` 開啟 `sha2` feature；`p256` / `p384` 開啟 `ecdsa` feature
 - 亂數來源使用 `rand_core::OsRng`（透過既有套件 re-export，不另加相依）
 

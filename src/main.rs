@@ -99,6 +99,7 @@ struct App {
     loaded: Option<Loaded>,
     info: Option<CertInfo>,
     info_note: Option<String>, // 憑證資訊尚未取得時的提示（例如 PFX 未解鎖）
+    key_match: Option<bool>,   // 私鑰是否與葉憑證成對（載入時計算一次）
 
     // 密碼欄（釋放時清零）
     open_password: Zeroizing<String>, // 用來解鎖 PFX
@@ -124,6 +125,7 @@ impl App {
         self.loaded = None;
         self.info = None;
         self.info_note = None;
+        self.key_match = None;
         self.open_password.clear();
         self.key_password.clear();
         self.out_password.clear();
@@ -135,6 +137,14 @@ impl App {
         self.reset();
         self.file_path = Some(path.to_path_buf());
 
+        // 憑證檔通常只有數 KB，過大的檔案多半是拖錯檔，避免整個讀進記憶體
+        const MAX_SIZE: u64 = 10 * 1024 * 1024;
+        if let Ok(meta) = std::fs::metadata(path) {
+            if meta.len() > MAX_SIZE {
+                self.err("檔案超過 10 MB，不像是憑證或金鑰檔");
+                return;
+            }
+        }
         let bytes = match std::fs::read(path) {
             Ok(b) => Zeroizing::new(b),
             Err(e) => {
@@ -156,6 +166,7 @@ impl App {
     fn set_loaded(&mut self, loaded: Loaded) {
         self.info = None;
         self.info_note = None;
+        self.key_match = None;
         match &loaded {
             Loaded::LockedPfx { .. } => {
                 self.info_note = Some("輸入密碼解鎖後即可顯示憑證內容。".to_string());
@@ -167,6 +178,7 @@ impl App {
                         Err(e) => self.info_note = Some(format!("無法解析憑證內容：{e}")),
                     }
                 }
+                self.key_match = items.key_matches_leaf();
                 for note in items.notes.clone() {
                     self.ok(note);
                 }
@@ -461,10 +473,7 @@ impl App {
         let Some(info) = &self.info else {
             return;
         };
-        let key_match = match &self.loaded {
-            Some(Loaded::Items(items)) => items.key_matches_leaf(),
-            _ => None,
-        };
+        let key_match = self.key_match;
 
         egui::CollapsingHeader::new("📄 憑證內容")
             .default_open(true)
